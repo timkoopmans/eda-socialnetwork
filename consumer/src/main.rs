@@ -19,10 +19,14 @@ use scylla::retry_policy::{DefaultRetryPolicy};
 use scylla::statement::{Consistency};
 use scylla::transport::session::Session;
 use scylla::transport::ExecutionProfile;
-use scylla::frame::value::CqlTimestamp;
 use scylla::{SessionBuilder};
 use uuid::Uuid;
 use std::env;
+use scylla::prepared_statement::PreparedStatement;
+use anyhow::Result;
+use tracing::info;
+
+const UPDATE_OFFSET: &str = "UPDATE ks.offset SET count = ? WHERE consumer = ?";
 
 async fn get_db() -> String {
     match env::var("SCYLLA_URL") {
@@ -106,6 +110,16 @@ struct QueryId {
 }
 
 async fn process_records(record: Vec<RecordAndOffset>, session: &Session) {
+    let add_user = session.prepare("INSERT INTO ks.users (id, name, registration_date) VALUES (?, ?, ?)").await.unwrap();
+    let store_event = session.prepare("INSERT INTO ks.events (id, ts, event_type, src_page) VALUES (?, ?, ?, ?)").await.unwrap();
+    let page_count = session.prepare("UPDATE ks.page_count SET count = count + 1 WHERE page = ?").await.unwrap();
+    let save_post = session.prepare("INSERT INTO ks.posts (id, ts, post_id, subject, content) VALUES (?, ?, ?, ?, ? )").await.unwrap();
+    let profile_views = session.prepare("UPDATE ks.profile_views SET count = count + 1 WHERE id = ?").await.unwrap();
+    let add_follower = session.prepare("INSERT INTO ks.follows (id, follower, ts) VALUES (?, ?, ?)").await.unwrap();
+    let post_like = session.prepare("UPDATE ks.post_likes SET count = count + 1 WHERE post_id = ?").await.unwrap();
+    let game_draw = session.prepare("UPDATE ks.game SET ts = ?, winner = ? WHERE id = ?").await.unwrap();
+    let winner_data = session.prepare("UPDATE ks.game SET email = ? WHERE id = ?").await.unwrap();
+
     // note: available fields are: `key`, `value`, `headers`, `timestamp`
     for i in record.iter() {
         let ts = i.record.timestamp;
@@ -131,46 +145,36 @@ async fn process_records(record: Vec<RecordAndOffset>, session: &Session) {
             Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
         };
 
-        println!("Processing {} event - {} - {} ", evtype, ts, r);
-
-        let add_user = session.prepare("INSERT INTO ks.users (id, name, registration_date) VALUES (?, ?, ?)").await.unwrap();
-        let store_event = session.prepare("INSERT INTO ks.events (id, ts, event_type, src_page) VALUES (?, ?, ?, ?)").await.unwrap();
-        let page_count = session.prepare("UPDATE ks.page_count SET count = count + 1 WHERE page = ?").await.unwrap();
-        let save_post = session.prepare("INSERT INTO ks.posts (id, ts, post_id, subject, content) VALUES (?, ?, ?, ?, ? )").await.unwrap();
-        let profile_views = session.prepare("UPDATE ks.profile_views SET count = count + 1 WHERE id = ?").await.unwrap();
-        let add_follower = session.prepare("INSERT INTO ks.follows (id, follower, ts) VALUES (?, ?, ?)").await.unwrap();
-        let post_like = session.prepare("UPDATE ks.post_likes SET count = count + 1 WHERE post_id = ?").await.unwrap();
-        let game_draw = session.prepare("UPDATE ks.game SET ts = ?, winner = ? WHERE id = ?").await.unwrap();
-        let winner_data = session.prepare("UPDATE ks.game SET email = ? WHERE id = ?").await.unwrap();
+        info!("Processing {} event - {} - {} ", evtype, ts, r);
 
         let null: Option<String> = None;
         match evtype {
             "CREATE" => {
                 let object: User = serde_json::from_str(r).unwrap();
-                session.execute(&add_user, (object.id, object.username, CqlTimestamp(ts.timestamp() * 1000))).await.unwrap();
-                session.execute(&store_event, (object.id, CqlTimestamp(ts.timestamp() * 1000), evtype, null)).await.unwrap();
+                session.execute(&add_user, (object.id, object.username, ts)).await.unwrap();
+                session.execute(&store_event, (object.id, ts, evtype, null)).await.unwrap();
             },
             "PAGE_VIEW" => {
                 let object: PageView = serde_json::from_str(r).unwrap();
                 session.execute(&page_count, (&object.page,)).await.unwrap();
-                session.execute(&store_event, (object.id, CqlTimestamp(ts.timestamp() * 1000), evtype, object.page)).await.unwrap();
+                session.execute(&store_event, (object.id, ts, evtype, object.page)).await.unwrap();
             }, 
             "POST" => {
                 let object: Post = serde_json::from_str(r).unwrap();
                 let post_id = Uuid::new_v4();
-                session.execute(&save_post, (object.id, CqlTimestamp(ts.timestamp() * 1000), post_id, object.subject, object.content)).await.unwrap();
-                session.execute(&store_event, (object.id, CqlTimestamp(ts.timestamp() * 1000), evtype, null)).await.unwrap();
+                session.execute(&save_post, (object.id, ts, post_id, object.subject, object.content)).await.unwrap();
+                session.execute(&store_event, (object.id, ts, evtype, null)).await.unwrap();
             },
             "POST_LIKE" => {
                 let object: PostLike = serde_json::from_str(r).unwrap();
                 session.execute(&post_like, (object.post_id,)).await.unwrap();
                 // Note: post_id is used here, find engagement on Posts of a specific user.
-                session.execute(&store_event, (object.post_id, CqlTimestamp(ts.timestamp() * 1000), evtype, null)).await.unwrap();
+                session.execute(&store_event, (object.post_id, ts, evtype, null)).await.unwrap();
             },
             "FOLLOW" => {
                 let object: Follow = serde_json::from_str(r).unwrap();
-                session.execute(&add_follower, (object.id, object.followed_id, CqlTimestamp(ts.timestamp() * 1000))).await.unwrap();
-                session.execute(&store_event, (object.id, CqlTimestamp(ts.timestamp() * 1000), evtype, null)).await.unwrap();
+                session.execute(&add_follower, (object.id, object.followed_id, ts)).await.unwrap();
+                session.execute(&store_event, (object.id, ts, evtype, null)).await.unwrap();
             },
             "USER_VIEW" => {
                 let object: QueryId = serde_json::from_str(r).unwrap();
@@ -179,15 +183,15 @@ async fn process_records(record: Vec<RecordAndOffset>, session: &Session) {
             },
             "GAME_DRAW" => {
                 let object: QueryId = serde_json::from_str(r).unwrap();
-                session.execute(&game_draw, (CqlTimestamp(ts.timestamp() * 1000), false, object.id,)).await.unwrap();
-                session.execute(&store_event, (object.id, CqlTimestamp(ts.timestamp() * 1000), evtype, null)).await.unwrap();
+                session.execute(&game_draw, (ts, false, object.id,)).await.unwrap();
+                session.execute(&store_event, (object.id, ts, evtype, null)).await.unwrap();
             },
             "WINNER_SUBMIT" => {
                 let object: WinnerData = serde_json::from_str(r).unwrap();
                 session.execute(&winner_data, (object.email, object.id,)).await.unwrap();
-                println!("User {} Won!", object.id);
+                info!("User {} Won!", object.id);
             },
-            _ => println!("Unknown event {}", evtype),
+            _ => info!("Unknown event {}", evtype),
         }
 
     }
@@ -230,6 +234,7 @@ async fn db_session() -> Session {
     session.query("CREATE TABLE IF NOT EXISTS ks.post_likes (post_id uuid PRIMARY KEY, count counter)", &[]).await.unwrap();
     session.query("CREATE TABLE IF NOT EXISTS ks.game (id uuid PRIMARY KEY, ts timestamp, winner boolean, email text)", &[]).await.unwrap();
     session.query("CREATE TABLE IF NOT EXISTS ks.winner (id uuid PRIMARY KEY)", &[]).await.unwrap();
+    session.query("CREATE TABLE IF NOT EXISTS ks.offset (consumer text PRIMARY KEY, count BigInt)", &[]).await.unwrap();
 
     session
 }
@@ -264,7 +269,7 @@ async fn consumer(client: &Client, topic: &str, offset: i64, session: &Session) 
 
 #[tokio::main]
 async fn main() {
-
+    tracing_subscriber::fmt::init();
     let client: Arc<Client> = broker_client(get_topic().await).await;
     let viewclient: Arc<Client> = broker_client(get_topic().await).await;
     let postclient: Arc<Client> = broker_client(get_topic().await).await;
@@ -278,19 +283,19 @@ async fn main() {
 
     tokio::spawn(async move {
         use std::time::Duration;
-        println!("Identity Consumer Started");
+        info!("Identity Consumer Started");
         let mut offset = 0;
         let session = db_session().await;
         loop {
             offset = consumer(&client, "identity", offset, &session).await;
             thread::sleep(Duration::from_secs(5));
-            //println!("[Identity] - Sleeping")
+            //info!("[Identity] - Sleeping")
         }
     });
 
     tokio::spawn(async move {
         use std::time::Duration;
-        println!("PageView Consumer Started");
+        info!("PageView Consumer Started");
         let mut offset = 0;
         let session = db_session().await;
         loop {
@@ -301,18 +306,21 @@ async fn main() {
 
     tokio::spawn(async move {
         use std::time::Duration;
-        println!("Posts Consumer Started");
-        let mut offset = 0;
+        info!("Posts Consumer Started");
         let session = db_session().await;
+        let update_counter = session.prepare(UPDATE_OFFSET).await.expect("Failed to prepare query");
+
         loop {
+            let mut offset = fetch_offset(&session, "posts").await.expect("Failed to fetch offset");
             offset = consumer(&postclient, "posts", offset, &session).await;
-            thread::sleep(Duration::from_secs(5));
+            update_offset(offset, &session, &update_counter, "posts").await.expect("Failed to update offset");
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 
     tokio::spawn(async move {
         use std::time::Duration;
-        println!("Follower Consumer Started");
+        info!("Follower Consumer Started");
         let mut offset = 0;
         let session = db_session().await;
         loop {
@@ -323,7 +331,7 @@ async fn main() {
 
     tokio::spawn(async move {
         use std::time::Duration;
-        println!("Game Consumer Started");
+        info!("Game Consumer Started");
         let mut offset = 0;
         let session = db_session().await;
         loop {
@@ -335,5 +343,23 @@ async fn main() {
     // Just sleep
     loop {
         sleep(Duration::from_secs(86400)).await;
+    }
+}
+
+async fn update_offset(offset: i64, session: &Session, update_counter: &PreparedStatement, consumer: &str) -> Result<()> {
+    session.execute(update_counter, (offset, consumer)).await?;
+
+    Ok(())
+}
+
+async fn fetch_offset(session: &Session, consumer: &str) -> Result<i64> {
+    let query = "SELECT count FROM ks.offset WHERE consumer = ?";
+    let values = (consumer,);
+    let result = session.query(query, values).await.expect("Failed to execute query");
+
+    if let Some(row) = result.maybe_first_row_typed::<(i64,)>().expect("Failed to get row") {
+        Ok(row.0)
+    } else {
+        Ok(0)
     }
 }
